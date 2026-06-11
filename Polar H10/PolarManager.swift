@@ -10,6 +10,7 @@
 import Foundation
 import Combine
 import CoreBluetooth
+import WidgetKit
 import PolarBleSdk
 
 /// A single discovered device row.
@@ -84,6 +85,10 @@ final class PolarManager: NSObject, ObservableObject {
     @Published var batteryLevel: Int?
     @Published var hrFeatureReady: Bool = false
 
+    /// Heart-derived metrics (HRV, zones, training load, respiration, VO₂max),
+    /// computed continuously while connected.
+    @Published var metrics = HeartMetrics()
+
     /// Rolling buffer of readings captured during the current recording session.
     @Published private(set) var readings: [HeartRateReading] = []
 
@@ -110,6 +115,15 @@ final class PolarManager: NSObject, ObservableObject {
     @Published var currentAcc: (x: Int, y: Int, z: Int) = (0, 0, 0)
     @Published private(set) var accRecording: [AccSample] = []
 
+    // Steps / cadence / activity derived from the accelerometer.
+    @Published var steps: Int = 0
+    @Published var cadence: Int = 0          // steps per minute
+    @Published var activity: String = "—"    // Still / Walking / Running
+
+    // Readable ECG summary.
+    @Published var ecgRhythm: String = "—"   // Regular / Slightly irregular / Irregular
+    @Published var ecgQuality: String = "—"  // Good / Weak signal
+
     /// Human-readable status / error line.
     @Published var statusMessage: String = "Idle"
 
@@ -128,10 +142,25 @@ final class PolarManager: NSObject, ObservableObject {
     private var lastHrDate: Date?
     private var activeSeconds: Double = 0
 
+    /// Heart-metrics state (reset when HR streaming starts).
+    private var rrSeries: [(t: Double, rr: Double)] = [] // cumulative beat time (s), RR (ms)
+    private var beatClock: Double = 0
+    private var lastMetricDate: Date?
+    private let rrWindowSeconds: Double = 120 // keep ~2 min of beats for HRV
+
+    /// Step-detection state (reset when ACC streaming starts).
+    private var accBaseline: Double = 0
+    private var accPrimed = false
+    private var prevAccDyn: Double = 0
+    private var lastStepT: Double = 0
+    private var recentStepT: [Double] = []
+
     /// Disk writer for the active session; nil when no session is running.
     private var sessionWriter: SessionWriter?
     /// Lock-screen / Dynamic Island Live Activity for the active session.
     private let liveActivity = LiveActivityController()
+    /// Throttle for home-screen widget reloads during a session.
+    private var lastWidgetReload: Date?
     /// User setting key: include ECG in the capture session (default true).
     private let kRecordEcg = "recordEcg"
     private var ecgRecordingEnabled: Bool {
@@ -283,6 +312,11 @@ final class PolarManager: NSObject, ObservableObject {
     func startStreaming() {
         guard let id = connectedDeviceId, !hrStreaming else { return }
         hrStreaming = true
+        // Fresh metrics for this connection.
+        metrics = HeartMetrics()
+        rrSeries.removeAll()
+        beatClock = 0
+        lastMetricDate = nil
         if !sessionActive { statusMessage = "Connected · streaming heart rate" }
 
         hrStreamTask = Task { [weak self] in
@@ -341,6 +375,8 @@ final class PolarManager: NSObject, ObservableObject {
             lastHrDate = nil
         }
 
+        updateMetrics(hr: Int(sample.hr), rrs: sample.rrsMs, contact: sample.contactStatus, now: now)
+
         let reading = HeartRateReading(
             date: now,
             bpm: Int(sample.hr),
@@ -357,12 +393,65 @@ final class PolarManager: NSObject, ObservableObject {
             let rr = sample.rrsMs.map(String.init).joined(separator: ";")
             writer.appendHr("\(isoFormatter.string(from: now)),\(sample.hr),\(rr),\(sample.contactStatus)\n")
             liveActivity.update(liveActivityState)
+            publishWidgetSummary()
         }
     }
 
     /// Most recent readings for the on-screen chart.
     var chartReadings: [HeartRateReading] {
         Array(readings.suffix(maxChartReadings))
+    }
+
+    /// Update the derived heart metrics from the latest sample.
+    private func updateMetrics(hr: Int, rrs: [Int], contact: Bool, now: Date) {
+        guard hr > 0 else { return }
+        var m = metrics
+
+        // Observed max / min (min only with good skin contact).
+        m.maxHr = max(m.maxHr, hr)
+        if contact { m.minHr = m.minHr == 0 ? hr : min(m.minHr, hr) }
+
+        // Accumulate RR intervals into the rolling tachogram.
+        for rr in rrs where rr > 0 {
+            beatClock += Double(rr) / 1000.0
+            rrSeries.append((t: beatClock, rr: Double(rr)))
+        }
+        if let lastT = rrSeries.last?.t {
+            while let first = rrSeries.first, first.t < lastT - rrWindowSeconds {
+                rrSeries.removeFirst()
+            }
+        }
+
+        // HRV over the rolling window.
+        let rrValues = rrSeries.map { $0.rr }
+        m.rmssd = HeartMetricsMath.rmssd(rrValues)
+        m.sdnn = HeartMetricsMath.sdnn(rrValues)
+        m.pnn50 = HeartMetricsMath.pnn50(rrValues)
+        m.respiration = HeartMetricsMath.respiration(beats: rrSeries, windowSec: 45)
+        ecgRhythm = HeartMetricsMath.rhythm(rrValues)
+
+        // HR zone + time-in-zone + training load (accumulated over elapsed time).
+        let maxHr = profile.effectiveMaxHr
+        m.currentZone = HeartMetricsMath.zone(hr: hr, maxHr: maxHr)
+        if let last = lastMetricDate {
+            let dt = now.timeIntervalSince(last)
+            if dt > 0 && dt < 10 {
+                if m.currentZone >= 1 && m.currentZone <= 5 {
+                    m.timeInZone[m.currentZone - 1] += dt
+                }
+                let perMin = HeartMetricsMath.trimpPerMinute(
+                    hr: hr, rest: profile.restingHr, max: maxHr, isMale: profile.sex == .male)
+                m.trimp += perMin * dt / 60.0
+            }
+        }
+        lastMetricDate = now
+
+        // Live VO₂max estimate from observed max & resting (falls back to profile).
+        let rest = m.minHr > 0 ? m.minHr : profile.restingHr
+        let est = HeartMetricsMath.vo2max(maxHr: m.maxHr, restingHr: rest)
+        m.vo2maxEstimate = est > 0 ? est : profile.effectiveVo2max
+
+        metrics = m
     }
 
     // MARK: - ECG recording (in-app)
@@ -400,6 +489,7 @@ final class PolarManager: NSObject, ObservableObject {
         ecgRecording.removeAll()
         ecgIndex = 0
         currentEcgUv = 0
+        ecgQuality = "—"
     }
 
     private func handleEcg(_ samples: PolarEcgData) {
@@ -414,6 +504,13 @@ final class PolarManager: NSObject, ObservableObject {
             ecgRecording.removeFirst(ecgRecording.count - maxEcgSamples)
         }
         if !batch.isEmpty { sessionWriter?.appendEcg(batch) }
+
+        // Signal quality from the peak-to-peak amplitude of the last ~1 s.
+        let recent = ecgRecording.suffix(130).map { $0.microvolts }
+        if let lo = recent.min(), let hi = recent.max(), recent.count > 30 {
+            let p2p = hi - lo
+            ecgQuality = !contactDetected ? "No contact" : (p2p < 150 ? "Weak signal" : "Good")
+        }
     }
 
     /// Most recent ECG samples for the on-screen waveform (~3 s).
@@ -448,6 +545,7 @@ final class PolarManager: NSObject, ObservableObject {
     func startAcc() {
         guard let id = connectedDeviceId, !accStreaming else { return }
         accStreaming = true
+        resetStepState()
         statusMessage = "Recording motion…"
         accTask = Task { [weak self] in
             guard let self else { return }
@@ -478,6 +576,18 @@ final class PolarManager: NSObject, ObservableObject {
         accRecording.removeAll()
         accIndex = 0
         currentAcc = (0, 0, 0)
+        resetStepState()
+    }
+
+    private func resetStepState() {
+        steps = 0
+        cadence = 0
+        activity = "Still"
+        accPrimed = false
+        accBaseline = 0
+        prevAccDyn = 0
+        lastStepT = 0
+        recentStepT.removeAll()
     }
 
     private func handleAcc(_ samples: PolarAccData) {
@@ -487,12 +597,48 @@ final class PolarManager: NSObject, ObservableObject {
                                           x: Int(sample.x), y: Int(sample.y), z: Int(sample.z)))
             if sessionWriter != nil { batch += "\(accIndex),\(sample.timeStamp),\(sample.x),\(sample.y),\(sample.z)\n" }
             accIndex += 1
+            detectStep(x: Double(sample.x), y: Double(sample.y), z: Double(sample.z),
+                       tSec: Double(sample.timeStamp) / 1_000_000_000.0)
         }
         if let last = samples.last { currentAcc = (Int(last.x), Int(last.y), Int(last.z)) }
         if accRecording.count > maxAccSamples {
             accRecording.removeFirst(accRecording.count - maxAccSamples)
         }
         if !batch.isEmpty { sessionWriter?.appendAcc(batch) }
+    }
+
+    /// Peak-detect steps from the acceleration magnitude (gravity removed).
+    private func detectStep(x: Double, y: Double, z: Double, tSec: Double) {
+        let mag = (x * x + y * y + z * z).squareRoot()  // milli-g, includes gravity
+        if !accPrimed { accBaseline = mag; accPrimed = true }
+        accBaseline += 0.01 * (mag - accBaseline)        // slow EMA ≈ gravity baseline
+        let dyn = mag - accBaseline
+
+        let threshold = 120.0     // mg above baseline
+        let refractory = 0.28     // s — caps cadence ≈ 214 spm
+        if dyn > threshold, prevAccDyn <= threshold, tSec - lastStepT > refractory {
+            steps += 1
+            lastStepT = tSec
+            recentStepT.append(tSec)
+            if recentStepT.count > 12 { recentStepT.removeFirst(recentStepT.count - 12) }
+            updateCadenceAndActivity(now: tSec)
+        }
+        prevAccDyn = dyn
+    }
+
+    private func updateCadenceAndActivity(now: Double) {
+        // Cadence from the recent step intervals (drop steps older than 6 s).
+        recentStepT.removeAll { now - $0 > 6 }
+        if recentStepT.count >= 2, let first = recentStepT.first, let last = recentStepT.last, last > first {
+            cadence = Int((Double(recentStepT.count - 1) / (last - first) * 60).rounded())
+        } else {
+            cadence = 0
+        }
+        switch cadence {
+        case 0:        activity = "Still"
+        case 1..<130:  activity = "Walking"
+        default:       activity = "Running"
+        }
     }
 
     /// Most recent ACC samples for the on-screen waveform (~2 s).
@@ -528,7 +674,38 @@ final class PolarManager: NSObject, ObservableObject {
 
         statusMessage = "Recording session…"
         liveActivity.start(startedAt: start, initial: liveActivityState)
+        publishWidgetSummary(reload: true)
         resumeSessionStreamsIfNeeded()
+    }
+
+    /// Write the latest session summary to the App Group for the home-screen
+    /// widget. Forces a timeline reload on start/stop, and throttled (~every
+    /// 20 s) during an active session — iOS rate-limits widget reloads, so this
+    /// is as "live" as a home-screen widget can be (use the Live Activity for
+    /// true real-time).
+    private func publishWidgetSummary(reload: Bool = false) {
+        SharedStore.save(SessionSummary(
+            calories: sessionCalories,
+            durationSeconds: sessionSeconds,
+            heartRate: currentHr,
+            steps: steps,
+            active: sessionActive,
+            updatedAt: Date().timeIntervalSince1970,
+            startedAt: sessionActive ? (sessionStartDate?.timeIntervalSince1970 ?? 0) : 0,
+            kcalPerMin: sessionActive ? CalorieEstimator.kcalPerMinute(hr: currentHr, profile: profile) : 0,
+            stepsPerMin: sessionActive ? Double(cadence) : 0
+        ))
+        var shouldReload = reload
+        if sessionActive, !reload {
+            let now = Date()
+            if let last = lastWidgetReload {
+                if now.timeIntervalSince(last) >= 20 { shouldReload = true }
+            } else {
+                shouldReload = true
+            }
+            if shouldReload { lastWidgetReload = now }
+        }
+        if shouldReload { WidgetCenter.shared.reloadAllTimelines() }
     }
 
     /// Current values packaged for the Live Activity.
@@ -537,9 +714,7 @@ final class PolarManager: NSObject, ObservableObject {
             calories: sessionCalories,
             durationSeconds: sessionSeconds,
             heartRate: currentHr,
-            accX: currentAcc.x,
-            accY: currentAcc.y,
-            accZ: currentAcc.z
+            steps: steps
         )
     }
 
@@ -560,6 +735,23 @@ final class PolarManager: NSObject, ObservableObject {
         d.removeObject(forKey: kSessionStart)
         d.removeObject(forKey: kSessionDevice)
 
+        // Archive this session into the rolling history for the sessions widget.
+        if sessionSeconds > 0 || sessionCalories > 0 {
+            SharedStore.appendHistory(SessionSummary(
+                calories: sessionCalories,
+                durationSeconds: sessionSeconds,
+                heartRate: metrics.maxHr,
+                steps: steps,
+                active: false,
+                updatedAt: Date().timeIntervalSince1970,
+                startedAt: sessionStartDate?.timeIntervalSince1970 ?? 0,
+                kcalPerMin: 0,
+                stepsPerMin: 0
+            ))
+        }
+
+        publishWidgetSummary(reload: true)
+        WidgetCenter.shared.reloadAllTimelines()
         statusMessage = "Session saved · \(readings.count) HR · \(ecgRecording.count) ECG · \(accRecording.count) ACC (recent)"
     }
 
@@ -632,98 +824,126 @@ final class PolarManager: NSObject, ObservableObject {
 }
 
 // MARK: - PolarBleApiObserver (Feature 3: connection status)
+//
+// The Polar SDK may deliver observer callbacks on a background queue, so every
+// callback hops to the main actor before touching @Published state (otherwise
+// SwiftUI logs "Publishing changes from background threads is not allowed").
+
+extension PolarManager {
+    /// Run `work` on the main actor (used by the nonisolated SDK callbacks).
+    nonisolated func onMain(_ work: @escaping @MainActor () -> Void) {
+        Task { @MainActor in work() }
+    }
+}
 
 extension PolarManager: PolarBleApiObserver {
-    func deviceConnecting(_ identifier: PolarDeviceInfo) {
-        connectionState = .connecting
-        connectedDeviceName = identifier.name.isEmpty ? identifier.deviceId : identifier.name
-        statusMessage = "Connecting to \(connectedDeviceName ?? "")…"
-    }
-
-    func deviceConnected(_ identifier: PolarDeviceInfo) {
-        connectionState = .connected
-        connectedDeviceId = identifier.deviceId
-        connectedDeviceName = identifier.name.isEmpty ? identifier.deviceId : identifier.name
-        statusMessage = sessionActive ? "Reconnected — resuming session…"
-                                      : "Connected to \(connectedDeviceName ?? "")"
-        // Streams are (re)started from the feature-ready callbacks below.
-    }
-
-    func deviceDisconnected(_ identifier: PolarDeviceInfo, pairingError: Bool) {
-        hrFeatureReady = false
-        onlineStreamingReady = false
-
-        if sessionActive {
-            // Keep the session alive: cancel the ended stream tasks but retain the
-            // device id and buffers. The SDK auto-reconnects (we never called
-            // disconnect), and streams resume from the feature-ready callbacks.
-            hrStreamTask?.cancel(); hrStreamTask = nil
-            ecgTask?.cancel(); ecgTask = nil
-            accTask?.cancel(); accTask = nil
-            hrStreaming = false
-            ecgStreaming = false
-            accStreaming = false
-            lastHrDate = nil   // calorie total is preserved; no gap integrated
-            connectionState = .connecting
-            statusMessage = "Connection lost — reconnecting…"
-            return
+    nonisolated func deviceConnecting(_ identifier: PolarDeviceInfo) {
+        onMain { [weak self] in
+            guard let self else { return }
+            self.connectionState = .connecting
+            self.connectedDeviceName = identifier.name.isEmpty ? identifier.deviceId : identifier.name
+            self.statusMessage = "Connecting to \(self.connectedDeviceName ?? "")…"
         }
+    }
 
-        connectionState = .disconnected
-        connectedDeviceId = nil
-        connectedDeviceName = nil
-        batteryLevel = nil
-        stopStreaming()
-        stopEcg()
-        stopAcc()
-        statusMessage = pairingError ? "Disconnected (pairing error)" : "Disconnected"
+    nonisolated func deviceConnected(_ identifier: PolarDeviceInfo) {
+        onMain { [weak self] in
+            guard let self else { return }
+            self.connectionState = .connected
+            self.connectedDeviceId = identifier.deviceId
+            self.connectedDeviceName = identifier.name.isEmpty ? identifier.deviceId : identifier.name
+            self.statusMessage = self.sessionActive ? "Reconnected — resuming session…"
+                                                     : "Connected to \(self.connectedDeviceName ?? "")"
+            // Streams are (re)started from the feature-ready callbacks below.
+        }
+    }
+
+    nonisolated func deviceDisconnected(_ identifier: PolarDeviceInfo, pairingError: Bool) {
+        onMain { [weak self] in
+            guard let self else { return }
+            self.hrFeatureReady = false
+            self.onlineStreamingReady = false
+
+            if self.sessionActive {
+                // Keep the session alive: cancel the ended stream tasks but retain
+                // the device id and buffers. The SDK auto-reconnects (we never
+                // called disconnect), and streams resume from feature-ready.
+                self.hrStreamTask?.cancel(); self.hrStreamTask = nil
+                self.ecgTask?.cancel(); self.ecgTask = nil
+                self.accTask?.cancel(); self.accTask = nil
+                self.hrStreaming = false
+                self.ecgStreaming = false
+                self.accStreaming = false
+                self.lastHrDate = nil   // calorie total is preserved; no gap integrated
+                self.connectionState = .connecting
+                self.statusMessage = "Connection lost — reconnecting…"
+                return
+            }
+
+            self.connectionState = .disconnected
+            self.connectedDeviceId = nil
+            self.connectedDeviceName = nil
+            self.batteryLevel = nil
+            self.stopStreaming()
+            self.stopEcg()
+            self.stopAcc()
+            self.statusMessage = pairingError ? "Disconnected (pairing error)" : "Disconnected"
+        }
     }
 }
 
 // MARK: - Power state
 
 extension PolarManager: PolarBleApiPowerStateObserver {
-    func blePowerOn() {
-        bluetoothOn = true
-        if statusMessage == "Bluetooth is off" { statusMessage = "Idle" }
+    nonisolated func blePowerOn() {
+        onMain { [weak self] in
+            guard let self else { return }
+            self.bluetoothOn = true
+            if self.statusMessage == "Bluetooth is off" { self.statusMessage = "Idle" }
+        }
     }
 
-    func blePowerOff() {
-        bluetoothOn = false
-        statusMessage = "Bluetooth is off"
+    nonisolated func blePowerOff() {
+        onMain { [weak self] in
+            guard let self else { return }
+            self.bluetoothOn = false
+            self.statusMessage = "Bluetooth is off"
+        }
     }
 }
 
 // MARK: - Feature readiness
 
 extension PolarManager: PolarBleApiDeviceFeaturesObserver {
-    func bleSdkFeatureReady(_ identifier: String, feature: PolarBleSdkFeature) {
-        switch feature {
-        case .feature_hr:
-            hrFeatureReady = true
-            // HR always streams while connected — start it as soon as it's ready.
-            startStreaming()
-        case .feature_polar_online_streaming:
-            onlineStreamingReady = true
-        default:
-            break
+    nonisolated func bleSdkFeatureReady(_ identifier: String, feature: PolarBleSdkFeature) {
+        onMain { [weak self] in
+            guard let self else { return }
+            switch feature {
+            case .feature_hr:
+                self.hrFeatureReady = true
+                // HR always streams while connected — start it as soon as it's ready.
+                self.startStreaming()
+            case .feature_polar_online_streaming:
+                self.onlineStreamingReady = true
+            default:
+                break
+            }
+            // Resume ECG/ACC for an in-progress session once streaming is ready.
+            self.resumeSessionStreamsIfNeeded()
         }
-        // Resume ECG/ACC for an in-progress session once streaming is ready
-        // (covers both fresh start and reconnect/restoration).
-        resumeSessionStreamsIfNeeded()
     }
 }
 
 // MARK: - Device info (battery)
 
 extension PolarManager: PolarBleApiDeviceInfoObserver {
-    func batteryLevelReceived(_ identifier: String, batteryLevel: UInt) {
-        self.batteryLevel = Int(batteryLevel)
+    nonisolated func batteryLevelReceived(_ identifier: String, batteryLevel: UInt) {
+        onMain { [weak self] in self?.batteryLevel = Int(batteryLevel) }
     }
 
-    func batteryChargingStatusReceived(_ identifier: String, chargingStatus: BleBasClient.ChargeState) {}
+    nonisolated func batteryChargingStatusReceived(_ identifier: String, chargingStatus: BleBasClient.ChargeState) {}
 
-    func disInformationReceived(_ identifier: String, uuid: CBUUID, value: String) {}
+    nonisolated func disInformationReceived(_ identifier: String, uuid: CBUUID, value: String) {}
 
-    func disInformationReceivedWithKeysAsStrings(_ identifier: String, key: String, value: String) {}
+    nonisolated func disInformationReceivedWithKeysAsStrings(_ identifier: String, key: String, value: String) {}
 }

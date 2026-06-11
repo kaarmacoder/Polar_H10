@@ -15,9 +15,7 @@ struct SessionActivityAttributes: ActivityAttributes {
         var calories: Double
         var durationSeconds: Int
         var heartRate: Int
-        var accX: Int
-        var accY: Int
-        var accZ: Int
+        var steps: Int
     }
 
     /// When the session began (static for the lifetime of the activity).

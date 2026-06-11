@@ -44,6 +44,30 @@ struct Card<Content: View>: View {
     }
 }
 
+/// A "what else this sensor can derive" informational card.
+struct SensorCapabilitiesNote: View {
+    let title: String
+    let items: [String]
+
+    var body: some View {
+        Card {
+            Label(title, systemImage: "lightbulb")
+                .font(.subheadline.bold())
+                .foregroundStyle(.secondary)
+            ForEach(items, id: \.self) { item in
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "plus.circle").font(.caption2).foregroundStyle(.secondary)
+                    Text(item).font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Text("Not yet computed — these are derivable from this sensor's data.")
+                .font(.caption2).foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
 /// Shown on the ECG / Motion tabs when there is no connected device.
 struct NotConnectedView: View {
     var body: some View {
@@ -77,6 +101,7 @@ struct HeartRateView: View {
                     statusCard
                     if polar.connectionState == .connected {
                         liveDataCard
+                        metricsCard
                         controlsCard
                         exportCard
                     } else {
@@ -249,6 +274,97 @@ struct HeartRateView: View {
         .foregroundStyle(polar.contactDetected ? .green : .orange)
     }
 
+    private var metricsCard: some View {
+        let m = polar.metrics
+        return Card {
+            Text("Heart Metrics").font(.headline)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            // HRV
+            Text("Heart-rate variability").font(.caption.bold()).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 16) {
+                metric("RMSSD", String(format: "%.0f", m.rmssd), "ms")
+                metric("SDNN", String(format: "%.0f", m.sdnn), "ms")
+                metric("pNN50", String(format: "%.0f", m.pnn50), "%")
+            }
+
+            Divider()
+
+            // Rates & fitness
+            HStack(spacing: 16) {
+                metric("Max HR", "\(m.maxHr)", "bpm")
+                metric("Min HR", "\(m.minHr)", "bpm")
+                metric("Resp.", m.respiration > 0 ? "\(m.respiration)" : "—", "br/min")
+            }
+            HStack(spacing: 16) {
+                metric("VO₂max", m.vo2maxEstimate > 0 ? String(format: "%.0f", m.vo2maxEstimate) : "—", "est")
+                metric("Load", String(format: "%.0f", m.trimp), "TRIMP")
+                metric("Zone", m.currentZone > 0 ? "Z\(m.currentZone)" : "Rest", "now")
+            }
+
+            Divider()
+
+            // Time in zone
+            Text("Time in zone").font(.caption.bold()).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            ForEach(0..<5, id: \.self) { i in
+                zoneRow(index: i, seconds: m.timeInZone[i], total: m.totalZoneTime)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 5) {
+                noteLine("HRV is most meaningful at rest (e.g. a morning reading) — it naturally collapses during exercise.")
+                noteLine("VO₂max & respiration are estimates derived from RR intervals — directional, not clinical.")
+                noteLine("VO₂max via HR is rough and firms up only after a real max effort and a true resting HR.")
+                noteLine("Min HR isn't your true resting HR unless it was measured while actually at rest.")
+            }
+        }
+    }
+
+    private func noteLine(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "info.circle").font(.caption2).foregroundStyle(.secondary)
+            Text(text).font(.caption2).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func metric(_ title: String, _ value: String, _ unit: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 2) {
+                Text(value).font(.title3.bold().monospacedDigit())
+                Text(unit).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func zoneRow(index: Int, seconds: Double, total: Double) -> some View {
+        let zoneColors: [Color] = [.gray, .blue, .green, .orange, .red]
+        let fraction = total > 0 ? seconds / total : 0
+        return HStack(spacing: 8) {
+            Text("Z\(index + 1)").font(.caption.monospacedDigit()).frame(width: 24, alignment: .leading)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color(.tertiarySystemFill))
+                    Capsule().fill(zoneColors[index])
+                        .frame(width: max(0, geo.size.width * fraction))
+                }
+            }
+            .frame(height: 10)
+            Text(zoneTime(seconds)).font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary).frame(width: 52, alignment: .trailing)
+        }
+    }
+
+    private func zoneTime(_ seconds: Double) -> String {
+        let s = Int(seconds)
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
+
     private var controlsCard: some View {
         Card {
             Button(role: .destructive) {
@@ -333,16 +449,68 @@ struct ECGView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     if polar.connectionState == .connected {
+                        readingCard
                         liveCard
                         recordCard
                     } else {
                         NotConnectedView()
                     }
+                    SensorCapabilitiesNote(
+                        title: "Also possible from ECG",
+                        items: [
+                            "Arrhythmia / ectopic-beat detection",
+                            "ECG-derived respiration (higher fidelity than RR-based)"
+                        ]
+                    )
                 }
                 .padding()
             }
             .navigationTitle("ECG")
             .background(Color(.systemGroupedBackground))
+        }
+    }
+
+    private var readingCard: some View {
+        Card {
+            Text("ECG Reading").font(.headline)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 16) {
+                reading("Heart rate", polar.currentHr > 0 ? "\(polar.currentHr)" : "—", "bpm", .red)
+                reading("Rhythm", polar.ecgRhythm, "", rhythmColor)
+                reading("Signal", polar.ecgStreaming ? polar.ecgQuality : "—", "", signalColor)
+            }
+            Text("Rhythm is a rough steadiness estimate from beat-to-beat timing — it is not a medical diagnosis. Record a strip and consult a clinician for any concern.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func reading(_ title: String, _ value: String, _ unit: String, _ color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 3) {
+                Text(value).font(.headline.bold().monospacedDigit()).foregroundStyle(color)
+                if !unit.isEmpty { Text(unit).font(.caption2).foregroundStyle(.secondary) }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var rhythmColor: Color {
+        switch polar.ecgRhythm {
+        case "Regular": return .green
+        case "Slightly irregular": return .orange
+        case "Irregular": return .red
+        default: return .secondary
+        }
+    }
+
+    private var signalColor: Color {
+        switch polar.ecgQuality {
+        case "Good": return .green
+        case "Weak signal": return .orange
+        case "No contact": return .red
+        default: return .secondary
         }
     }
 
@@ -455,6 +623,14 @@ struct MotionView: View {
                     } else {
                         NotConnectedView()
                     }
+                    SensorCapabilitiesNote(
+                        title: "Also possible from motion",
+                        items: [
+                            "Steps & cadence",
+                            "Activity type (still / walking / running)",
+                            "Motion-based energy (METs) to complement HR calories"
+                        ]
+                    )
                 }
                 .padding()
             }
@@ -465,49 +641,61 @@ struct MotionView: View {
 
     private var liveCard: some View {
         Card {
-            Text("Accelerometer").font(.headline)
-            Text("Up to 200 Hz · milli-g per axis")
-                .font(.caption).foregroundStyle(.secondary)
-
-            HStack(spacing: 16) {
-                axisValue("X", polar.currentAcc.x, .red)
-                axisValue("Y", polar.currentAcc.y, .green)
-                axisValue("Z", polar.currentAcc.z, .blue)
+            HStack {
+                Text("Steps").font(.headline)
+                Spacer()
+                Label(polar.activity, systemImage: activityIcon)
+                    .font(.caption.bold())
+                    .foregroundStyle(activityColor)
             }
 
-            let samples = Array(polar.accWaveform)
-            if samples.count > 1 {
-                Chart {
-                    ForEach(samples) { s in
-                        LineMark(x: .value("Sample", s.index), y: .value("mg", s.x),
-                                 series: .value("axis", "X"))
-                            .foregroundStyle(.red)
-                        LineMark(x: .value("Sample", s.index), y: .value("mg", s.y),
-                                 series: .value("axis", "Y"))
-                            .foregroundStyle(.green)
-                        LineMark(x: .value("Sample", s.index), y: .value("mg", s.z),
-                                 series: .value("axis", "Z"))
-                            .foregroundStyle(.blue)
-                    }
-                }
-                .chartXAxis(.hidden)
-                .frame(height: 180)
-            } else {
-                Text("Start recording to see motion data.")
-                    .font(.subheadline).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 120)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "figure.walk")
+                    .foregroundStyle(.blue).font(.title)
+                Text("\(polar.steps)")
+                    .font(.system(size: 64, weight: .bold, design: .rounded))
+                    .monospacedDigit().contentTransition(.numericText())
+                Spacer()
+            }
+
+            HStack(spacing: 16) {
+                statBox("Cadence", "\(polar.cadence)", "steps/min")
+                statBox("Activity", polar.activity, "now")
+            }
+
+            if !polar.accStreaming {
+                Text("Press Start to begin counting steps from the accelerometer.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
 
-    private func axisValue(_ label: String, _ value: Int, _ color: Color) -> some View {
-        VStack {
-            Text(label).font(.caption).foregroundStyle(color)
-            Text("\(value)")
-                .font(.title3.monospacedDigit().bold())
-                .contentTransition(.numericText())
+    private var activityIcon: String {
+        switch polar.activity {
+        case "Running": return "figure.run"
+        case "Walking": return "figure.walk"
+        default:         return "figure.stand"
         }
-        .frame(maxWidth: .infinity)
+    }
+
+    private var activityColor: Color {
+        switch polar.activity {
+        case "Running": return .red
+        case "Walking": return .green
+        default:         return .secondary
+        }
+    }
+
+    private func statBox(_ title: String, _ value: String, _ unit: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 3) {
+                Text(value).font(.title3.bold().monospacedDigit())
+                Text(unit).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var recordCard: some View {
@@ -524,7 +712,7 @@ struct MotionView: View {
                     Button {
                         polar.startAcc()
                     } label: {
-                        Label("Record Motion", systemImage: "record.circle").frame(maxWidth: .infinity)
+                        Label("Start", systemImage: "figure.walk").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent).tint(.green)
                     .disabled(!polar.onlineStreamingReady)
@@ -606,6 +794,11 @@ struct CaloriesView: View {
                 metric("Duration", value: formattedDuration)
                 metric("Heart rate", value: polar.currentHr > 0 ? "\(polar.currentHr) bpm" : "—")
                 metric("Rate", value: ratePerMin)
+            }
+            HStack(spacing: 24) {
+                metric("Steps", value: "\(polar.steps)")
+                metric("Cadence", value: polar.cadence > 0 ? "\(polar.cadence)/min" : "—")
+                metric("Activity", value: polar.activity)
             }
 
             if polar.connectionState != .connected {
