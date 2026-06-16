@@ -44,6 +44,48 @@ struct Card<Content: View>: View {
     }
 }
 
+/// Explains the five %-of-max-HR training zones. Shown in the Heart Metrics
+/// card and the session detail dashboard. When `maxHr` is known it also shows
+/// the matching bpm range for each zone.
+struct ZoneLegend: View {
+    var maxHr: Int = 0
+
+    /// Colors mirror the time-in-zone bars (Z1…Z5).
+    private let colors: [Color] = [.gray, .blue, .green, .orange, .red]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("What the zones mean").font(.caption.bold()).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            ForEach(Array(HRZones.all.enumerated()), id: \.element.id) { idx, z in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Circle().fill(colors[idx]).frame(width: 9, height: 9)
+                        .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
+                    Text("Z\(z.zone)").font(.caption.bold().monospacedDigit())
+                        .frame(width: 22, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 6) {
+                            Text(z.name).font(.caption.bold())
+                            Text(z.rangeLabel).font(.caption2).foregroundStyle(.secondary)
+                            if maxHr > 0 {
+                                Text("· \(HRZones.bpmRange(z, maxHr: maxHr))")
+                                    .font(.caption2).foregroundStyle(.tertiary)
+                            }
+                        }
+                        Text(z.purpose).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if maxHr > 0 {
+                Text("Ranges are % of your max HR (\(maxHr) bpm). Set your real max in the Calories profile for accurate zones.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+}
+
 /// A "what else this sensor can derive" informational card.
 struct SensorCapabilitiesNote: View {
     let title: String
@@ -93,6 +135,7 @@ struct HeartRateView: View {
     @State private var exportInProgress = false
     @State private var alertMessage: String?
     @State private var hrScroll: Date = .now
+    @State private var showHistory = false
 
     var body: some View {
         NavigationStack {
@@ -112,6 +155,18 @@ struct HeartRateView: View {
             }
             .navigationTitle("Polar H10")
             .background(Color(.systemGroupedBackground))
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showHistory = true
+                    } label: {
+                        Label("History", systemImage: "clock.arrow.circlepath")
+                    }
+                }
+            }
+            .sheet(isPresented: $showHistory) {
+                HistoryView()
+            }
             .alert("Notice", isPresented: Binding(
                 get: { alertMessage != nil },
                 set: { if !$0 { alertMessage = nil } }
@@ -311,6 +366,11 @@ struct HeartRateView: View {
             ForEach(0..<5, id: \.self) { i in
                 zoneRow(index: i, seconds: m.timeInZone[i], total: m.totalZoneTime)
             }
+
+            Divider()
+
+            // What the zones mean (percentage of max HR).
+            ZoneLegend(maxHr: polar.profile.effectiveMaxHr)
 
             Divider()
 

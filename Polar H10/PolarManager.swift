@@ -142,6 +142,13 @@ final class PolarManager: NSObject, ObservableObject {
     private var lastHrDate: Date?
     private var activeSeconds: Double = 0
 
+    /// Session-total accumulators for the saved history record (uncapped, unlike
+    /// the in-memory `readings`/`ecgRecording`/`accRecording` chart buffers).
+    private var sessionHrSum = 0
+    private var sessionHrCount = 0
+    private var sessionEcgCount = 0
+    private var sessionAccCount = 0
+
     /// Heart-metrics state (reset when HR streaming starts).
     private var rrSeries: [(t: Double, rr: Double)] = [] // cumulative beat time (s), RR (ms)
     private var beatClock: Double = 0
@@ -361,6 +368,7 @@ final class PolarManager: NSObject, ObservableObject {
 
         // Integrate calories only while a capture session is running.
         if sessionActive {
+            if sample.hr > 0 { sessionHrSum += Int(sample.hr); sessionHrCount += 1 }
             if let last = lastHrDate {
                 let dt = now.timeIntervalSince(last)
                 if dt > 0 && dt < 10 { // ignore large gaps (dropouts)
@@ -496,7 +504,7 @@ final class PolarManager: NSObject, ObservableObject {
         var batch = ""
         for sample in samples {
             ecgRecording.append(EcgSample(index: ecgIndex, timeStamp: sample.timeStamp, microvolts: Int(sample.voltage)))
-            if sessionWriter != nil { batch += "\(ecgIndex),\(sample.timeStamp),\(sample.voltage)\n" }
+            if sessionWriter != nil { batch += "\(ecgIndex),\(sample.timeStamp),\(sample.voltage)\n"; sessionEcgCount += 1 }
             ecgIndex += 1
         }
         if let last = samples.last { currentEcgUv = Int(last.voltage) }
@@ -595,7 +603,7 @@ final class PolarManager: NSObject, ObservableObject {
         for sample in samples {
             accRecording.append(AccSample(index: accIndex, timeStamp: sample.timeStamp,
                                           x: Int(sample.x), y: Int(sample.y), z: Int(sample.z)))
-            if sessionWriter != nil { batch += "\(accIndex),\(sample.timeStamp),\(sample.x),\(sample.y),\(sample.z)\n" }
+            if sessionWriter != nil { batch += "\(accIndex),\(sample.timeStamp),\(sample.x),\(sample.y),\(sample.z)\n"; sessionAccCount += 1 }
             accIndex += 1
             detectStep(x: Double(sample.x), y: Double(sample.y), z: Double(sample.z),
                        tSec: Double(sample.timeStamp) / 1_000_000_000.0)
@@ -660,6 +668,10 @@ final class PolarManager: NSObject, ObservableObject {
         activeSeconds = 0
         lastHrDate = nil
         lastSessionZipURL = nil
+        sessionHrSum = 0
+        sessionHrCount = 0
+        sessionEcgCount = 0
+        sessionAccCount = 0
 
         let start = Date()
         sessionStartDate = start
@@ -726,6 +738,24 @@ final class PolarManager: NSObject, ObservableObject {
         sessionActive = false
         lastHrDate = nil
         liveActivity.end(liveActivityState)
+
+        // Persist the consolidated session record (meta.json) so it shows in the
+        // History dashboard. Written before the ZIP so it's bundled inside it.
+        if let stamp = sessionWriter?.stamp, let start = sessionStartDate {
+            let m = metrics
+            let record = SessionRecord(
+                stamp: stamp, startedAt: start, endedAt: Date(),
+                deviceName: connectedDeviceName, durationSeconds: sessionSeconds,
+                calories: sessionCalories, steps: steps,
+                avgHr: sessionHrCount > 0 ? sessionHrSum / sessionHrCount : 0,
+                maxHr: m.maxHr, minHr: m.minHr,
+                rmssd: m.rmssd, sdnn: m.sdnn, pnn50: m.pnn50,
+                respiration: m.respiration, vo2max: m.vo2maxEstimate, trimp: m.trimp,
+                timeInZone: m.timeInZone,
+                hrSampleCount: sessionHrCount,
+                ecgSampleCount: sessionEcgCount, accSampleCount: sessionAccCount)
+            SessionStore.save(record)
+        }
 
         // Finalize the recording (flush + zip) off the main thread so a long
         // session doesn't freeze the UI on Stop.

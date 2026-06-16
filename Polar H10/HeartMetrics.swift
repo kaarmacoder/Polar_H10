@@ -8,6 +8,39 @@
 
 import Foundation
 
+/// One heart-rate training zone (percentage-of-max model). Shared by the live
+/// dashboard legend, the time-in-zone bars and the session history.
+struct HRZoneInfo: Identifiable {
+    let zone: Int        // 1…5
+    let lowerPct: Int    // % of max HR (inclusive lower bound)
+    let upperPct: Int    // % of max HR (exclusive upper bound, 100 for Z5)
+    let name: String
+    let purpose: String
+    var id: Int { zone }
+
+    /// "50–60%" style label.
+    var rangeLabel: String { "\(lowerPct)–\(upperPct)%" }
+}
+
+enum HRZones {
+    /// The five %-of-max-HR zones, matching `HeartMetricsMath.zone(...)`.
+    static let all: [HRZoneInfo] = [
+        HRZoneInfo(zone: 1, lowerPct: 50, upperPct: 60,  name: "Very light", purpose: "Warm-up & recovery"),
+        HRZoneInfo(zone: 2, lowerPct: 60, upperPct: 70,  name: "Light",      purpose: "Fat burn, base endurance"),
+        HRZoneInfo(zone: 3, lowerPct: 70, upperPct: 80,  name: "Moderate",   purpose: "Aerobic, tempo"),
+        HRZoneInfo(zone: 4, lowerPct: 80, upperPct: 90,  name: "Hard",       purpose: "Anaerobic threshold"),
+        HRZoneInfo(zone: 5, lowerPct: 90, upperPct: 100, name: "Maximum",    purpose: "VO₂max effort"),
+    ]
+
+    /// BPM range for a zone given a max HR, e.g. "120–140 bpm".
+    static func bpmRange(_ info: HRZoneInfo, maxHr: Int) -> String {
+        guard maxHr > 0 else { return "—" }
+        let lo = Int((Double(info.lowerPct) / 100 * Double(maxHr)).rounded())
+        let hi = Int((Double(info.upperPct) / 100 * Double(maxHr)).rounded())
+        return "\(lo)–\(hi) bpm"
+    }
+}
+
 struct HeartMetrics: Equatable {
     var rmssd: Double = 0          // ms
     var sdnn: Double = 0           // ms

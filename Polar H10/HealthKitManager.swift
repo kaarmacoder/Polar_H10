@@ -154,12 +154,40 @@ final class HealthKitManager: ObservableObject {
                 start: snapshot, end: snapshot, device: device, metadata: nil))
         }
 
-        try await store.save(samples)
+        // Save in batches so very long sessions never hand HealthKit one huge
+        // array — nothing is dropped, it just goes "in parts".
+        let batchSize = 1000
+        var i = 0
+        while i < samples.count {
+            let chunk = Array(samples[i..<min(i + batchSize, samples.count)])
+            try await store.save(chunk)
+            i += batchSize
+        }
+
         let hrCount = data.readings.count
         let extra = samples.count - hrCount
         lastExportMessage = extra > 0
             ? "Exported \(hrCount) heart-rate samples + \(extra) metric\(extra == 1 ? "" : "s") to Health."
             : "Exported \(hrCount) heart-rate samples to Health."
         return samples.count
+    }
+
+    /// Export a saved session in full: every heart-rate sample from its CSV
+    /// (uncapped, batched) plus the consolidated metrics from the record.
+    @discardableResult
+    func export(record: SessionRecord) async throws -> Int {
+        let readings = SessionStore.readings(for: record.stamp)
+        let data = HealthExportData(
+            readings: readings,
+            deviceName: record.deviceName,
+            steps: record.steps,
+            activeCalories: record.calories,
+            sdnn: record.sdnn,
+            respiration: record.respiration,
+            vo2max: record.vo2max,
+            intervalStart: record.startedAt,
+            intervalEnd: record.endedAt
+        )
+        return try await export(data)
     }
 }
