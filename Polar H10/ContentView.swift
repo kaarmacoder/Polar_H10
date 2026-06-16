@@ -385,7 +385,7 @@ struct HeartRateView: View {
         Card {
             Text("Apple Health").font(.headline)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Text("Save the captured heart-rate readings to the iOS Health app.")
+            Text("Save this session to the Health app: heart rate, plus steps, active energy, HRV, respiration and VO₂max when available.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -414,14 +414,24 @@ struct HeartRateView: View {
 
     private func exportToHealth() {
         exportInProgress = true
-        let readings = polar.readings
-        let name = polar.connectedDeviceName
+        let m = polar.metrics
+        let data = HealthExportData(
+            readings: polar.readings,
+            deviceName: polar.connectedDeviceName,
+            steps: polar.steps,
+            activeCalories: polar.sessionCalories,
+            sdnn: m.sdnn,
+            respiration: m.respiration,
+            vo2max: m.vo2maxEstimate,
+            intervalStart: polar.readings.first?.date,
+            intervalEnd: polar.readings.last?.date
+        )
         Task {
             defer { exportInProgress = false }
             do {
-                let count = try await health.export(readings, deviceName: name)
+                let count = try await health.export(data)
                 polar.resetSession()
-                alertMessage = "Saved \(count) heart-rate samples to the Health app."
+                alertMessage = "Saved \(count) samples to the Health app."
             } catch {
                 alertMessage = error.localizedDescription
             }
