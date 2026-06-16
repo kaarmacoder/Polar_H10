@@ -10,10 +10,14 @@
 
 import Foundation
 
-final class SessionWriter {
+final class SessionWriter: @unchecked Sendable {
 
     let stamp: String
     let directory: URL
+
+    /// All FileHandle access happens on this serial queue, so streaming bursts
+    /// never block the main thread with synchronous disk I/O.
+    private let ioQueue = DispatchQueue(label: "com.polarh10.session.io", qos: .utility)
 
     private var hrHandle: FileHandle?
     private var ecgHandle: FileHandle?
@@ -63,20 +67,27 @@ final class SessionWriter {
         return h
     }
 
-    func appendHr(_ s: String)  { try? hrHandle?.write(contentsOf: Data(s.utf8)) }
-    func appendEcg(_ s: String) { try? ecgHandle?.write(contentsOf: Data(s.utf8)) }
-    func appendAcc(_ s: String) { try? accHandle?.write(contentsOf: Data(s.utf8)) }
+    // Appends are dispatched asynchronously to the serial I/O queue — they never
+    // block the caller (the BLE callbacks run on the main actor).
+    func appendHr(_ s: String)  { let d = Data(s.utf8); ioQueue.async { [weak self] in try? self?.hrHandle?.write(contentsOf: d) } }
+    func appendEcg(_ s: String) { let d = Data(s.utf8); ioQueue.async { [weak self] in try? self?.ecgHandle?.write(contentsOf: d) } }
+    func appendAcc(_ s: String) { let d = Data(s.utf8); ioQueue.async { [weak self] in try? self?.accHandle?.write(contentsOf: d) } }
 
+    /// Flush and close all files. Synchronous on the I/O queue, so it waits for
+    /// any pending async writes to finish first.
     func close() {
-        for h in [hrHandle, ecgHandle, accHandle] {
-            try? h?.synchronize()
-            try? h?.close()
+        ioQueue.sync {
+            for h in [hrHandle, ecgHandle, accHandle] {
+                try? h?.synchronize()
+                try? h?.close()
+            }
+            hrHandle = nil; ecgHandle = nil; accHandle = nil
         }
-        hrHandle = nil; ecgHandle = nil; accHandle = nil
     }
 
     /// Zip the session directory into the temp dir for sharing. No third-party
     /// dependency — uses NSFileCoordinator's `.forUploading` option.
+    /// Call off the main thread — it flushes the files and zips synchronously.
     func makeZip() -> URL? {
         close()
         let coordinator = NSFileCoordinator()

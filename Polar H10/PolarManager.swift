@@ -727,7 +727,16 @@ final class PolarManager: NSObject, ObservableObject {
         lastHrDate = nil
         liveActivity.end(liveActivityState)
 
-        lastSessionZipURL = sessionWriter?.makeZip()
+        // Finalize the recording (flush + zip) off the main thread so a long
+        // session doesn't freeze the UI on Stop.
+        if let writer = sessionWriter {
+            lastSessionZipURL = nil
+            statusMessage = "Saving session…"
+            Task.detached(priority: .utility) { [weak self] in
+                let url = writer.makeZip()
+                await MainActor.run { self?.lastSessionZipURL = url }
+            }
+        }
         sessionWriter = nil
 
         let d = UserDefaults.standard
